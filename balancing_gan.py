@@ -57,21 +57,10 @@ class BalancingGAN:
         cnn.add(Conv2D(64, (3, 3), padding='same', strides=(1, 1), use_bias=True))
         cnn.add(LeakyReLU())
         cnn.add(Dropout(0.3))
-        cnn.add(Conv2D(128, (3, 3), padding='same', strides=(2, 2), use_bias=True))
-        cnn.add(LeakyReLU())
-        cnn.add(Dropout(0.3))
-        cnn.add(Conv2D(256, (3, 3), padding='same', strides=(1, 1), use_bias=True))
-        cnn.add(LeakyReLU())
-        cnn.add(Dropout(0.3))
-
-        while cnn.output_shape[-1] > min_latent_res:
-            cnn.add(Conv2D(256, (3, 3), padding='same', strides=(2, 2), use_bias=True))
+        if resolution > min_latent_res:
+            cnn.add(Conv2D(128, (3, 3), padding='same', strides=(2, 2), use_bias=True))
             cnn.add(LeakyReLU())
             cnn.add(Dropout(0.3))
-            cnn.add(Conv2D(256, (3, 3), padding='same', strides=(1, 1), use_bias=True))
-            cnn.add(LeakyReLU())
-            cnn.add(Dropout(0.3))
-
         cnn.add(Flatten())
         features = cnn(image)
         return features
@@ -127,12 +116,12 @@ class BalancingGAN:
         self.trained = False
 
         self.build_generator(latent_size, init_resolution=min_latent_res)
-        self.generator.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1), loss='sparse_categorical_crossentropy')
+        self.generator.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1, clipnorm=1.0), loss='categorical_crossentropy')
         latent_gen = Input(shape=(latent_size,))
         self.build_discriminator(min_latent_res=min_latent_res)
-        self.discriminator.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1), loss='sparse_categorical_crossentropy')
+        self.discriminator.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1, clipnorm=1.0), loss='categorical_crossentropy')
         self.build_reconstructor(latent_size, min_latent_res=min_latent_res)
-        self.reconstructor.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1), loss='mean_squared_error')
+        self.reconstructor.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1, clipnorm=1.0), loss='mean_squared_error')
 
         fake = self.generator(latent_gen)
         self.discriminator.trainable = False
@@ -140,7 +129,7 @@ class BalancingGAN:
         self.generator.trainable = True
         aux = self.discriminate(fake)
         self.combined = Model(inputs=latent_gen, outputs=aux)
-        self.combined.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1), loss='sparse_categorical_crossentropy')
+        self.combined.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1, clipnorm=1.0), loss='categorical_crossentropy')
 
         self.discriminator.trainable = False
         self.generator.trainable = True
@@ -148,7 +137,7 @@ class BalancingGAN:
         img_for_reconstructor = Input(shape=(self.channels, self.resolution, self.resolution))
         img_reconstruct = self.generator(self.reconstructor(img_for_reconstructor))
         self.autoenc_0 = Model(inputs=img_for_reconstructor, outputs=img_reconstruct)
-        self.autoenc_0.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1), loss='mean_squared_error')
+        self.autoenc_0.compile(optimizer=Adam(learning_rate=self.adam_lr, beta_1=self.adam_beta_1, clipnorm=1.0), loss='mean_squared_error')
 
     def _biased_sample_labels(self, samples, target_distribution="uniform"):
         distribution = self.class_uratio
@@ -173,12 +162,26 @@ class BalancingGAN:
             sampled_labels = self._biased_sample_labels(fake_size, "d")
             latent_gen = self.generate_latent(sampled_labels, bg_train)
             generated_images = self.generator.predict(latent_gen, verbose=0)
+            if np.any(np.isnan(generated_images)) or np.any(np.isinf(generated_images)):
+                print("Warning: NaN or Inf in generated images")
+                continue
             X = np.concatenate((image_batch, generated_images))
-            aux_y = np.concatenate((label_batch, np.full(len(sampled_labels), max(self.classes) + 1)), axis=0)
-            epoch_disc_loss.append(self.discriminator.train_on_batch(X, aux_y))
+            # Apply label smoothing and one-hot encoding
+            real_labels = np.ones((len(label_batch), self.nclasses + 1)) * 0.1
+            for i, l in enumerate(label_batch):
+                real_labels[i, self.label_map[l]] = 0.9
+            fake_labels = np.zeros((len(sampled_labels), self.nclasses + 1))
+            fake_labels[:, self.nclasses] = 0.9
+            aux_y = np.concatenate((real_labels, fake_labels), axis=0)
+            disc_loss = self.discriminator.train_on_batch(X, aux_y)
+            epoch_disc_loss.append(disc_loss)
             sampled_labels = self._biased_sample_labels(fake_size + crt_batch_size, "g")
             latent_gen = self.generate_latent(sampled_labels, bg_train)
-            epoch_gen_loss.append(self.combined.train_on_batch(latent_gen, sampled_labels))
+            gen_labels = np.zeros((len(sampled_labels), self.nclasses + 1))
+            for i, l in enumerate(sampled_labels):
+                gen_labels[i, self.label_map[l]] = 0.9
+            gen_loss = self.combined.train_on_batch(latent_gen, gen_labels)
+            epoch_gen_loss.append(gen_loss)
         return np.mean(np.array(epoch_disc_loss), axis=0), np.mean(np.array(epoch_gen_loss), axis=0)
 
     def _set_class_ratios(self):
@@ -227,11 +230,13 @@ class BalancingGAN:
             print("BAGAN: training autoencoder")
             autoenc_train_loss = []
             for e in range(self.autoenc_epochs):
-                print(f'Autoencoder train epoch: {e+1}/{self.autoenc_epochs}')
                 autoenc_train_loss_crt = []
                 for image_batch, _ in bg_train.next_batch():
-                    autoenc_train_loss_crt.append(self.autoenc_0.train_on_batch(image_batch, image_batch))
-                autoenc_train_loss.append(np.mean(np.array(autoenc_train_loss_crt), axis=0))
+                    loss = self.autoenc_0.train_on_batch(image_batch, image_batch)
+                    autoenc_train_loss_crt.append(loss)
+                mean_loss = np.mean(np.array(autoenc_train_loss_crt), axis=0)
+                autoenc_train_loss.append(mean_loss)
+                print(f"Autoencoder epoch {e+1}/{self.autoenc_epochs}, mean loss: {mean_loss}")
             autoenc_loss_fname = f"{self.res_dir}/{self.target_class_id}_autoencoder.csv"
             with open(autoenc_loss_fname, 'w') as csvfile:
                 for item in autoenc_train_loss:
@@ -251,8 +256,17 @@ class BalancingGAN:
             for c in self.classes:
                 imgs = bg_train.get_samples_for_class(c, len(bg_train.per_class_ids[c]))
                 latent = self.reconstructor.predict(imgs, verbose=0)
-                self.covariances.append(np.cov(np.transpose(latent)))
-                self.means.append(np.mean(latent, axis=0))
+                try:
+                    cov = np.cov(np.transpose(latent))
+                    if np.any(np.isnan(cov)) or np.any(np.isinf(cov)):
+                        print(f"Warning: Invalid covariance for class {c}, using identity matrix")
+                        cov = np.eye(latent.shape[1])
+                    self.covariances.append(cov)
+                    self.means.append(np.mean(latent, axis=0))
+                except Exception as e:
+                    print(f"Error computing covariance for class {c}: {e}, using identity matrix")
+                    self.covariances.append(np.eye(latent.shape[1]))
+                    self.means.append(np.zeros(latent.shape[1]))
             self.covariances = np.array(self.covariances)
             self.means = np.array(self.means)
             cfname = f"{self.res_dir}/{self.target_class_id}_covariances.npy"
@@ -263,18 +277,16 @@ class BalancingGAN:
 
     def _get_lst_bck_name(self, element):
         import re
-        # Match files like bck_c_{class_id}_{element}_e_{epoch}.weights.h5
         pattern = rf'bck_c_{self.target_class_id}_{element}_e_(\d+)\.weights\.h5'
         files = [f for f in os.listdir(self.res_dir) if re.match(pattern, f)]
         if not files:
             return 0, None
-        # Find the file with the highest epoch
         max_epoch = -1
         max_fname = None
         for fname in files:
             match = re.match(pattern, fname)
             if match:
-                epoch = int(match.group(1))  # Extract epoch number
+                epoch = int(match.group(1))
                 if epoch > max_epoch:
                     max_epoch = epoch
                     max_fname = fname
@@ -345,12 +357,23 @@ class BalancingGAN:
                 sampled_labels = self._biased_sample_labels(nb_test, "d")
                 latent_gen = self.generate_latent(sampled_labels, bg_test)
                 generated_images = self.generator.predict(latent_gen, verbose=0)
+                if np.any(np.isnan(generated_images)) or np.any(np.isinf(generated_images)):
+                    print("Warning: NaN or Inf in test generated images")
+                    continue
                 X = np.concatenate((bg_test.dataset_x, generated_images))
-                aux_y = np.concatenate((bg_test.dataset_y, np.full(len(sampled_labels), max(self.classes) + 1)), axis=0)
+                real_labels = np.ones((nb_test, self.nclasses + 1)) * 0.1
+                for i, l in enumerate(bg_test.dataset_y):
+                    real_labels[i, self.label_map[l]] = 0.9
+                fake_labels = np.zeros((len(sampled_labels), self.nclasses + 1))
+                fake_labels[:, self.nclasses] = 0.9
+                aux_y = np.concatenate((real_labels, fake_labels), axis=0)
                 test_disc_loss = self.discriminator.evaluate(X, aux_y, verbose=0)
                 sampled_labels = self._biased_sample_labels(fake_size + nb_test, "g")
                 latent_gen = self.generate_latent(sampled_labels, bg_test)
-                test_gen_loss = self.combined.evaluate(latent_gen, sampled_labels, verbose=0)
+                gen_labels = np.zeros((len(sampled_labels), self.nclasses + 1))
+                for i, l in enumerate(sampled_labels):
+                    gen_labels[i, self.label_map[l]] = 0.9
+                test_gen_loss = self.combined.evaluate(latent_gen, gen_labels, verbose=0)
                 self.train_history['disc_loss'].append(train_disc_loss)
                 self.train_history['gen_loss'].append(train_gen_loss)
                 self.test_history['disc_loss'].append(test_disc_loss)
