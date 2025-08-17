@@ -263,32 +263,44 @@ class BalancingGAN:
 
     def _get_lst_bck_name(self, element):
         import re
-        files = [f for f in os.listdir(self.res_dir) if re.match(rf'bck_c_{self.target_class_id}_{element}', f)]
-        if files:
-            fname = files[0]
-            e_str = os.path.splitext(fname)[0].split("_")[-1]
-            epoch = int(e_str)
-            return epoch, fname
-        return 0, None
+        # Match files like bck_c_{class_id}_{element}_e_{epoch}.weights.h5
+        pattern = rf'bck_c_{self.target_class_id}_{element}_e_(\d+)\.weights\.h5'
+        files = [f for f in os.listdir(self.res_dir) if re.match(pattern, f)]
+        if not files:
+            return 0, None
+        # Find the file with the highest epoch
+        max_epoch = -1
+        max_fname = None
+        for fname in files:
+            match = re.match(pattern, fname)
+            if match:
+                epoch = int(match.group(1))  # Extract epoch number
+                if epoch > max_epoch:
+                    max_epoch = epoch
+                    max_fname = fname
+        return max_epoch, max_fname
 
     def init_gan(self):
         epoch, generator_fname = self._get_lst_bck_name("generator")
         new_e, discriminator_fname = self._get_lst_bck_name("discriminator")
-        if new_e != epoch:
+        if new_e != epoch or generator_fname is None or discriminator_fname is None:
             return 0
         try:
             self.generator.load_weights(os.path.join(self.res_dir, generator_fname))
             self.discriminator.load_weights(os.path.join(self.res_dir, discriminator_fname))
             return epoch
-        except:
+        except Exception as e:
+            print(f"Error loading weights: {e}")
             return 0
 
     def backup_point(self, epoch):
         _, old_bck_g = self._get_lst_bck_name("generator")
         _, old_bck_d = self._get_lst_bck_name("discriminator")
         try:
-            os.remove(os.path.join(self.res_dir, old_bck_g))
-            os.remove(os.path.join(self.res_dir, old_bck_d))
+            if old_bck_g:
+                os.remove(os.path.join(self.res_dir, old_bck_g))
+            if old_bck_d:
+                os.remove(os.path.join(self.res_dir, old_bck_d))
         except:
             pass
         generator_fname = f"{self.res_dir}/bck_c_{self.target_class_id}_generator_e_{epoch}.weights.h5"
