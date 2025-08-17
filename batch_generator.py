@@ -32,22 +32,39 @@ class BatchGenerator:
         for ann in self.coco_data["annotations"]:
             img_id = ann["image_id"]
             category_id = ann["category_id"]
-            bbox = ann["bbox"]
-            img_info = images[img_id]
+            img_info = images.get(img_id)
+            if not img_info:
+                print(f"Warning: Image ID {img_id} not found in images")
+                continue
             img_path = os.path.join(self.image_dir, img_info["file_name"])
-            img = Image.open(img_path).convert("RGB")
-            img_array = np.array(img)
-            x, y, w, h = [int(v) for v in bbox]
-            cropped = img_array[y:y+h, x:x+w, :]
-            cropped_img = Image.fromarray(cropped).resize((32, 32))
-            cropped_array = np.array(cropped_img)
-            cropped_array = (cropped_array / 127.5) - 1.0  # Normalize to [-1, 1]
-            dataset_x.append(cropped_array)
-            dataset_y.append(category_id)
-            per_class_ids[category_id].append(len(dataset_x) - 1)
+            try:
+                img = Image.open(img_path).convert("RGB")
+                img_array = np.array(img)
+                # Validate image dimensions
+                if img_array.shape[2] != 3:
+                    print(f"Warning: Image {img_path} has invalid channels: {img_array.shape}")
+                    continue
+                # Resize to 32x32
+                resized_img = img.resize((32, 32))
+                img_array = np.array(resized_img)
+                # Normalize to [-1, 1]
+                img_array = (img_array / 127.5) - 1.0
+                if np.any(np.isnan(img_array)) or np.any(np.isinf(img_array)):
+                    print(f"Warning: NaN or Inf in image {img_path}")
+                    continue
+                dataset_x.append(img_array)
+                dataset_y.append(category_id)
+                per_class_ids[category_id].append(len(dataset_x) - 1)
+            except Exception as e:
+                print(f"Error processing image {img_path}: {e}")
+                continue
+
+        if not dataset_x:
+            raise ValueError("No valid images loaded. Check dataset and annotations.")
 
         dataset_x = np.array(dataset_x)
         dataset_y = np.array(dataset_y)
+        print("Class counts before unbalancing:", {c: len(per_class_ids[c]) for c in self.classes})
         if self.class_to_prune is not None and self.unbalance is not None:
             keep_indices = []
             class_counts = {c: len(per_class_ids[c]) for c in self.classes}
@@ -58,12 +75,15 @@ class BatchGenerator:
                     n_keep = int(self.unbalance * max_samples)
                     if n_keep < len(indices):
                         indices = np.random.choice(indices, n_keep, replace=False)
+                    if n_keep < 10:
+                        print(f"Warning: Class {c} has only {n_keep} samples after unbalancing")
                 keep_indices.extend(indices)
             dataset_x = dataset_x[keep_indices]
             dataset_y = dataset_y[keep_indices]
             per_class_ids = {c: [] for c in self.classes}
             for i, label in enumerate(dataset_y):
                 per_class_ids[label].append(i)
+        print("Class counts after unbalancing:", {c: len(per_class_ids[c]) for c in self.classes})
 
         # Convert to channels_first
         dataset_x = np.transpose(dataset_x, (0, 3, 1, 2))
